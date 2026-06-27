@@ -218,10 +218,24 @@ class VoiceBookingApp {
             });
             const j = await res.json();
             const text = (j.text || "").trim();
-            if (!text) { this.announce("Chưa nghe rõ.", "Chạm để nói lại giúp tôi.", true); return; }
+            if (!text) {
+                // Silence / nothing heard -> re-prompt and listen again, capped at 2 tries.
+                this._emptyCount = (this._emptyCount || 0) + 1;
+                if (this._emptyCount <= 2) {
+                    const m = "Mình chưa nghe rõ.", s = "Bạn nói lại giúp tôi nhé.";
+                    this.announce(m, s, false);
+                    await this.speak(`${m} ${s}`);
+                    this._autoListen();
+                } else {
+                    this._emptyCount = 0;
+                    this.announce("Mình vẫn chưa nghe được.", "Chạm nút khi bạn sẵn sàng nói nhé.", true);
+                }
+                return;
+            }
+            this._emptyCount = 0;
             this._send(text);
         } catch (e) {
-            this.announce("Lỗi nhận diện giọng nói.", "Bạn thử lại hoặc gõ lệnh ở ô bên dưới.", true);
+            this.announce("Lỗi nhận diện giọng nói.", "Bạn thử lại hoặc chạm nút nói lại.", true);
         }
     }
 

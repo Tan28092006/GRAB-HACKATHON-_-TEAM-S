@@ -13,6 +13,7 @@ Enforced flow (the system prompt + tool split keep it on-rails):
 Tools are the only source of real data (coords/distance/price), never invented.
 """
 import json
+import re
 
 from voice import groq_client, GROQ_MODEL
 from geocode import resolve_destination
@@ -27,17 +28,33 @@ SYSTEM_PROMPT = (
     "LUỒNG BẮT BUỘC, đúng thứ tự — không được nhảy bước:\n"
     "1) Người dùng nêu điểm đến → GỌI resolve_destination(query). "
     "Nếu có nhiều cơ sở (alternatives) hoặc chưa chắc: ĐỌC RÕ các lựa chọn và HỎI người dùng chọn "
-    "cái nào, hoặc nói địa điểm khác. LẶP LẠI resolve cho đến khi người dùng XÁC NHẬN đúng MỘT điểm. "
+    "cái nào, hoặc nói địa điểm khác. Nếu người dùng nói KHÔNG ĐÚNG / từ chối điểm vừa nêu → đề xuất "
+    "cơ sở khác trong alternatives hoặc hỏi tên địa điểm khác, rồi GỌI LẠI resolve_destination. "
+    "LẶP cho đến khi người dùng XÁC NHẬN đúng MỘT điểm (dù phải hỏi nhiều lần). "
     "Ở bước này TUYỆT ĐỐI KHÔNG nói khoảng cách hay giá.\n"
     "2) Sau khi người dùng đã xác nhận đúng điểm → HỎI 'Bạn muốn đi xe ôm điện hay ô tô điện?'. "
     "Sau khi người dùng chọn loại xe → GỌI get_quote(vehicle) với loại xe đó. "
     "Rồi ĐỌC LẠI: tên + địa chỉ + khoảng cách + giá, và HỎI 'Bạn xác nhận đặt xe chứ?'.\n"
+    "2b) Nếu người dùng muốn ĐỔI LOẠI XE (kể cả sau khi đã nghe giá vì thấy đắt) → GỌI LẠI "
+    "get_quote với loại xe MỚI và báo giá mới; KHÔNG hỏi lại điểm đến.\n"
     "3) Nếu người dùng ĐỒNG Ý → GỌI book_ride(vehicle), báo thông tin tài xế. "
-    "Nếu người dùng KHÔNG đồng ý → HỎI 'Bạn muốn tìm địa điểm khác, hay không đặt nữa?'. "
-    "Muốn tìm khác → quay lại bước 1. Không đặt nữa → nói lời tạm biệt lịch sự và DỪNG (đừng gọi tool nữa).\n"
+    "Nếu người dùng KHÔNG đồng ý → HỎI 'Bạn muốn đổi loại xe, tìm địa điểm khác, hay không đặt nữa?'. "
+    "Đổi xe → bước 2b. Tìm chỗ khác → quay lại bước 1. Không đặt nữa → nói lời tạm biệt lịch sự và DỪNG.\n"
     "Quy tắc: tiếng Việt, mỗi lượt 1–2 câu, rõ ràng, ấm áp. Chỉ dùng số liệu từ tool, KHÔNG bịa. "
-    "Mặc định xe ôm điện (bike); đổi sang car nếu người dùng yêu cầu."
+    "Mặc định xe ôm điện (bike); đổi sang car nếu người dùng yêu cầu. "
+    "Khi cần dùng tool, hãy gọi qua cơ chế tool-calling; TUYỆT ĐỐI không viết tên hàm hay JSON vào câu trả lời."
 )
+
+
+def _clean_reply(text):
+    """Strip any leaked function-call/JSON markup so TTS never reads garbage."""
+    if not text:
+        return ""
+    for marker in ("<function", "<tool_call", "<|python_tag|>", "```"):
+        i = text.find(marker)
+        if i != -1:
+            text = text[:i]
+    return text.strip()
 
 TOOLS = [
     {"type": "function", "function": {
@@ -143,7 +160,10 @@ def run_agent(messages: list[dict]) -> dict:
         m = resp.choices[0].message
         msgs.append(m.model_dump(exclude_none=True))
         if not m.tool_calls:
-            return {"reply": m.content or "", "messages": msgs, "ui": ui}
+            reply = _clean_reply(m.content or "")
+            if not reply:
+                reply = "Bạn cho tôi biết tên địa điểm cụ thể hơn giúp tôi nhé."
+            return {"reply": reply, "messages": msgs, "ui": ui}
 
         for tc in m.tool_calls:
             try:

@@ -27,10 +27,12 @@ class VoiceRecorder {
     async start(opts = {}) {
         this.onAutoStop = opts.onAutoStop || null;
         this.silenceMs = opts.silenceMs || 1300;
+        this.noSpeechMs = opts.noSpeechMs || 6000;   // give up if nothing is said
         this.speechThreshold = opts.speechThreshold || 0.018;
         this._speechStarted = false;
         this._silenceStart = null;
         this._autoStopped = false;
+        this._t0 = (typeof performance !== "undefined" ? performance.now() : 0);
 
         this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
@@ -59,6 +61,10 @@ class VoiceRecorder {
                         this._autoStopped = true;
                         try { this.onAutoStop(); } catch (err) {}
                     }
+                } else if (now - this._t0 > this.noSpeechMs) {
+                    // Nothing said at all -> give up so we can re-prompt.
+                    this._autoStopped = true;
+                    try { this.onAutoStop(); } catch (err) {}
                 }
             }
         };
