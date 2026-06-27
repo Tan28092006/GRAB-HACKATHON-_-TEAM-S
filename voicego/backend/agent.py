@@ -14,10 +14,13 @@ Tools are the only source of real data (coords/distance/price), never invented.
 """
 import json
 import re
+import unicodedata
 
 from voice import groq_client, GROQ_MODEL
-from geocode import resolve_destination
+from geocode import resolve_destination, _nominatim, _haversine_km
 from routing import road_route
+
+MAX_ALT_KM = 80  # drop same-name places too far away (e.g. another province)
 
 ORIGIN = {"name": "Trường Đại học Quốc tế", "lat": 10.8782, "lng": 106.8012}
 PRICE = {"bike": {"base": 12000, "perKm": 4000}, "car": {"base": 29000, "perKm": 12000}}
@@ -27,11 +30,11 @@ SYSTEM_PROMPT = (
     "Điểm đón CỐ ĐỊNH: Trường Đại học Quốc tế (Thủ Đức); người dùng chỉ nói ĐIỂM ĐẾN.\n"
     "LUỒNG BẮT BUỘC, đúng thứ tự — không được nhảy bước:\n"
     "1) Người dùng nêu điểm đến → GỌI resolve_destination(query). "
-    "Nếu có nhiều cơ sở (alternatives) hoặc chưa chắc: ĐỌC RÕ các lựa chọn và HỎI người dùng chọn "
-    "cái nào, hoặc nói địa điểm khác. Nếu người dùng nói KHÔNG ĐÚNG / từ chối điểm vừa nêu → đề xuất "
-    "cơ sở khác trong alternatives hoặc hỏi tên địa điểm khác, rồi GỌI LẠI resolve_destination. "
-    "LẶP cho đến khi người dùng XÁC NHẬN đúng MỘT điểm (dù phải hỏi nhiều lần). "
-    "Ở bước này TUYỆT ĐỐI KHÔNG nói khoảng cách hay giá.\n"
+    "Nếu trả về NHIỀU candidates: ĐỌC danh sách theo SỐ THỨ TỰ (1, 2, ...) kèm khu vực, HỎI người dùng "
+    "chọn số mấy (hoặc nói tên/khu vực). Khi người dùng chọn → GỌI select_candidate(index) đúng số đó. "
+    "Nếu chỉ 1 (kind=place) → đó là điểm đến. "
+    "Nếu người dùng từ chối / muốn chỗ khác → GỌI LẠI resolve_destination với địa điểm mới. "
+    "LẶP đến khi chốt đúng MỘT điểm. Ở bước này TUYỆT ĐỐI KHÔNG nói khoảng cách hay giá.\n"
     "2) Sau khi người dùng đã xác nhận đúng điểm → HỎI 'Bạn muốn đi xe ôm điện hay ô tô điện?'. "
     "Sau khi người dùng chọn loại xe → GỌI get_quote(vehicle) với loại xe đó. "
     "Rồi ĐỌC LẠI: tên + địa chỉ + khoảng cách + giá, và HỎI 'Bạn xác nhận đặt xe chứ?'.\n"
@@ -66,6 +69,13 @@ TOOLS = [
                        "required": ["query"]},
     }},
     {"type": "function", "function": {
+        "name": "select_candidate",
+        "description": "Chọn 1 ứng viên trong danh sách candidates gần nhất theo SỐ THỨ TỰ (1, 2, ...).",
+        "parameters": {"type": "object",
+                       "properties": {"index": {"type": "integer", "description": "Số thứ tự ứng viên (bắt đầu từ 1)"}},
+                       "required": ["index"]},
+    }},
+    {"type": "function", "function": {
         "name": "get_quote",
         "description": "CHỈ gọi sau khi người dùng đã xác nhận đúng điểm đến. Tính quãng đường thật + giá.",
         "parameters": {"type": "object",
@@ -87,6 +97,31 @@ def _quote_price(vehicle, distance_km):
     return round((p["base"] + p["perKm"] * (distance_km or 0)) / 1000) * 1000
 
 
+def _norm(s):
+    s = (s or "").lower()
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return s.replace("đ", "d")
+
+
+def _picked_vehicle(msgs):
+    """Did the user explicitly choose a vehicle in the last few user turns?
+    Returns 'car' | 'bike' | None. Gates get_quote so the agent must ASK first."""
+    n = 0
+    for m in reversed(msgs):
+        if m.get("role") != "user":
+            continue
+        n += 1
+        t = _norm(m.get("content", ""))
+        if any(k in t for k in ["o to", "oto", "taxi", "bon banh", "4 banh", "xe hoi"]):
+            return "car"
+        if any(k in t for k in ["xe om", "xe may", "2 banh", "hai banh", "om dien", "may dien"]):
+            return "bike"
+        if n >= 4:
+            break
+    return None
+
+
 def _last_tool(msgs, kind):
     """Most recent tool result of a given kind (place/quote) from the history."""
     for m in reversed(msgs):
@@ -100,21 +135,71 @@ def _last_tool(msgs, kind):
     return None
 
 
+def _short_name(text):
+    t = (text or "").split(":")[0].strip()
+    return t[:60] if t else (text or "")[:60]
+
+
+def _geocode_text(text):
+    """Coords for an alternative's text (full string, then the part after ':')."""
+    return _nominatim(text) or _nominatim((text or "").split(":")[-1].strip())
+
+
 def _do_resolve(query):
     r = resolve_destination(query, ORIGIN["lat"], ORIGIN["lng"])
     if not r.get("ok"):
         return {"ok": False, "kind": "place", "reason": r.get("reason", "not_found")}
-    return {
-        "ok": True, "kind": "place", "name": r["name"], "address": r.get("address"),
-        "lat": r["lat"], "lng": r["lng"], "alternatives": r.get("alternatives", []),
-    }
+
+    # Build a candidate LIST with real coords (primary + geocoded alternatives) so
+    # the user can pick a specific branch later (selection has actual memory).
+    candidates = [{"name": r["name"], "address": r.get("address"), "lat": r["lat"], "lng": r["lng"]}]
+    for alt in (r.get("alternatives") or [])[:3]:
+        c = _geocode_text(alt)
+        # Keep only alternatives within the city region (skip same-name far places).
+        if c and _haversine_km(ORIGIN["lat"], ORIGIN["lng"], c[0], c[1]) <= MAX_ALT_KM:
+            candidates.append({"name": _short_name(alt), "address": alt, "lat": c[0], "lng": c[1]})
+
+    # De-dupe candidates that resolve to (almost) the same spot.
+    uniq = []
+    for c in candidates:
+        if not any(abs(c["lat"] - u["lat"]) < 1e-3 and abs(c["lng"] - u["lng"]) < 1e-3 for u in uniq):
+            uniq.append(c)
+
+    if len(uniq) == 1:
+        p = uniq[0]
+        return {"ok": True, "kind": "place", "name": p["name"], "address": p.get("address"),
+                "lat": p["lat"], "lng": p["lng"],
+                "next": "Hỏi người dùng 'xe ôm điện hay ô tô điện' TRƯỚC khi get_quote."}
+    return {"ok": True, "kind": "candidates", "candidates": uniq,
+            "next": "Đọc danh sách candidates theo SỐ THỨ TỰ (1,2,...) và hỏi người dùng chọn số mấy, "
+                    "rồi gọi select_candidate(index)."}
+
+
+def _do_select(msgs, index):
+    cset = _last_tool(msgs, "candidates")
+    cs = (cset or {}).get("candidates") or []
+    try:
+        i = int(index) - 1
+    except (TypeError, ValueError):
+        i = -1
+    if i < 0 or i >= len(cs):
+        return {"ok": False, "kind": "place", "reason": "bad_index"}
+    p = cs[i]
+    return {"ok": True, "kind": "place", "name": p["name"], "address": p.get("address"),
+            "lat": p["lat"], "lng": p["lng"],
+            "next": "Hỏi người dùng 'xe ôm điện hay ô tô điện' TRƯỚC khi get_quote."}
 
 
 def _do_quote(msgs, vehicle):
     place = _last_tool(msgs, "place")
     if not place:
         return {"ok": False, "kind": "quote", "reason": "no_destination"}
-    vehicle = "car" if vehicle == "car" else "bike"
+    # Guardrail: do NOT quote until the user has explicitly chosen a vehicle.
+    picked = _picked_vehicle(msgs)
+    if not picked:
+        return {"ok": False, "kind": "quote", "reason": "need_vehicle",
+                "message": "Chưa chọn loại xe. Hãy HỎI người dùng muốn 'xe ôm điện hay ô tô điện' trước khi báo giá."}
+    vehicle = picked  # trust what the user actually said
     rt = road_route(ORIGIN["lat"], ORIGIN["lng"], place["lat"], place["lng"])
     km = rt["distanceKm"] if rt else None
     price = _quote_price(vehicle, km or 0)
@@ -173,10 +258,16 @@ def run_agent(messages: list[dict]) -> dict:
             name = tc.function.name
             if name == "resolve_destination":
                 res = _do_resolve(args.get("query", ""))
+                if res.get("ok") and res.get("kind") == "place":
+                    ui["destination"] = {"name": res["name"], "address": res.get("address"),
+                                         "lat": res["lat"], "lng": res["lng"]}
+                    ui.pop("quote", None)
+            elif name == "select_candidate":
+                res = _do_select(msgs, args.get("index"))
                 if res.get("ok"):
                     ui["destination"] = {"name": res["name"], "address": res.get("address"),
                                          "lat": res["lat"], "lng": res["lng"]}
-                    ui.pop("quote", None)  # new place -> drop any old quote/route
+                    ui.pop("quote", None)
             elif name == "get_quote":
                 res = _do_quote(msgs, args.get("vehicle", "bike"))
                 if res.get("ok"):
