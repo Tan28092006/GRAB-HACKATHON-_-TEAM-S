@@ -50,13 +50,15 @@ SYSTEM_PROMPT = (
 
 
 def _clean_reply(text):
-    """Strip any leaked function-call/JSON markup so TTS never reads garbage."""
+    """Strip leaked function-call/JSON + markdown so TTS reads clean Vietnamese."""
     if not text:
         return ""
     for marker in ("<function", "<tool_call", "<|python_tag|>", "```"):
         i = text.find(marker)
         if i != -1:
             text = text[:i]
+    text = text.replace("**", "").replace("__", "").replace("`", "")
+    text = re.sub(r"(?m)^\s*#+\s*", "", text)   # markdown headers
     return text.strip()
 
 TOOLS = [

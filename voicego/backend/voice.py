@@ -24,9 +24,12 @@ FPT_API_KEY = os.getenv("FPT_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-# Groq (OpenAI-compatible) — primary LLM for the agent: fast + generous limits.
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+# Groq (OpenAI-compatible). Separate keys so Whisper STT has its own quota.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")               # LLM (agent + geocode)
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")  # smart agent brain
+GROQ_GEOCODE_MODEL = os.getenv("GROQ_GEOCODE_MODEL", "llama-3.1-8b-instant")  # cheap
+GROQ_WHISPER_KEY = os.getenv("GROQ_WHISPER_KEY", "")       # Whisper STT only
+GROQ_WHISPER_MODEL = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 ASR_URL = "https://api.fpt.ai/hmi/asr/general"
@@ -34,7 +37,7 @@ TTS_URL = "https://api.fpt.ai/hmi/tts/v5"
 
 
 def groq_client():
-    """Return an OpenAI client pointed at Groq, or None if no key/SDK."""
+    """OpenAI client pointed at Groq (LLM key), or None if no key/SDK."""
     if not GROQ_API_KEY:
         return None
     try:
@@ -45,19 +48,37 @@ def groq_client():
 
 
 def groq_json(prompt: str) -> str | None:
-    """One-shot Groq completion (used by geocode's no-grounding fallback)."""
+    """One-shot completion on the CHEAP model (geocode no-grounding fallback)."""
     client = groq_client()
     if not client:
         return None
     try:
         r = client.chat.completions.create(
-            model=GROQ_MODEL,
+            model=GROQ_GEOCODE_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
         )
         return (r.choices[0].message.content or "").strip()
     except Exception:  # noqa: BLE001
         return None
+
+
+def whisper_stt(audio_bytes: bytes, filename: str = "speech.wav") -> dict:
+    """Transcribe Vietnamese audio via Groq Whisper-large-v3-turbo (own key)."""
+    if not GROQ_WHISPER_KEY:
+        return {"text": "", "error": "no_whisper_key"}
+    try:
+        from openai import OpenAI
+        import io
+        client = OpenAI(base_url=GROQ_BASE_URL, api_key=GROQ_WHISPER_KEY)
+        buf = io.BytesIO(audio_bytes)
+        buf.name = filename
+        r = client.audio.transcriptions.create(
+            model=GROQ_WHISPER_MODEL, file=buf, language="vi", temperature=0,
+        )
+        return {"text": (r.text or "").strip()}
+    except Exception as e:  # noqa: BLE001
+        return {"text": "", "error": f"whisper_failed: {e}"}
 
 
 def speech_to_text(audio_bytes: bytes) -> dict:

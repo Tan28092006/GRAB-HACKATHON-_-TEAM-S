@@ -10,7 +10,7 @@ from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel
 
 from data import NODES
-from voice import speech_to_text, text_to_speech
+from voice import speech_to_text, text_to_speech, whisper_stt
 from geocode import resolve_destination
 from agent import run_agent
 
@@ -47,9 +47,12 @@ def health():
 
 @app.post("/api/voice/stt")
 async def voice_stt(file: UploadFile = File(...)):
-    """Transcribe an uploaded audio clip (wav/mp3) via FPT ASR."""
+    """Transcribe Vietnamese audio via Groq Whisper (accurate); FPT ASR fallback."""
     audio = await file.read()
-    return speech_to_text(audio)
+    result = whisper_stt(audio, file.filename or "speech.wav")
+    if not result.get("text"):
+        result = speech_to_text(audio)  # fallback if Whisper unavailable
+    return result
 
 
 @app.post("/api/voice/tts")

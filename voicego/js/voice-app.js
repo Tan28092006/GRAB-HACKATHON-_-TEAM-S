@@ -136,81 +136,99 @@ class VoiceBookingApp {
         if (this.els.liveTranscript) this.els.liveTranscript.textContent = "";
     }
 
+    // Live caption (browser STT) — visual only; Whisper does the real transcription.
+    _startCaption() {
+        const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SR) return;
+        try {
+            this._cap = new SR();
+            this._cap.lang = "vi-VN"; this._cap.interimResults = true; this._cap.continuous = true;
+            this._cap.onresult = (e) => {
+                let t = ""; for (const r of e.results) t += r[0].transcript;
+                if (this.els.liveTranscript) this.els.liveTranscript.textContent = t ? `“${t}…”` : "";
+            };
+            this._cap.onerror = () => {};
+            this._cap.start();
+        } catch (e) { this._cap = null; }
+    }
+    _stopCaption() {
+        if (this._cap) { try { this._cap.stop(); } catch (e) {} this._cap = null; }
+    }
+
     /**
-     * Tap once -> speak -> the browser's Vietnamese speech engine recognizes it and
-     * AUTO-STOPS when you pause (native endpointing), then sends the text to the
-     * agent. We use this for input because it proved noticeably more accurate for
-     * Vietnamese than FPT ASR. FPT still SPEAKS the replies (TTS).
+     * Tap once -> speak -> auto-stops on silence (VAD) -> sends audio to the server,
+     * which transcribes with Groq Whisper (accurate Vietnamese). A browser caption
+     * shows words live; Whisper is the authoritative text. FPT speaks the replies.
      */
-    startListening() {
-        if (this.busy || this.recording) return;
+    async startListening() {
+        if (this.busy || this.recording || this._starting) return;
         if (!BACKEND_URL) {
             this.announce("Chế độ ngoại tuyến.", "Cần chạy server agent để dùng giọng nói.", true);
             return;
         }
-        const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-        if (!SR) {
-            this.announce("Trình duyệt chưa hỗ trợ nhận giọng nói.", "Hãy dùng Chrome nhé.", true);
-            return;
-        }
-
-        this.recording = true;
-        this._srErr = null;
+        this._starting = true;
+        this._wantStop = false;
         this._vibrate(40);
         if (this.els.recordBtn) this.els.recordBtn.classList.add("recording");
         this._setRecLabel("🎙️ Đang nghe…");
         this.announce("Đang nghe…", "Nói điểm đến — tôi tự nhận khi bạn ngừng nói.");
         if (this.els.liveTranscript) this.els.liveTranscript.textContent = "";
 
-        let finalText = "";
-        const sr = new SR();
-        this.sr = sr;
-        sr.lang = "vi-VN";
-        sr.interimResults = true;
-        sr.continuous = false;     // auto-stop after the user pauses
-        sr.maxAlternatives = 1;
-
-        sr.onresult = (e) => {
-            let interim = "";
-            for (const r of e.results) {
-                if (r.isFinal) finalText += r[0].transcript;
-                else interim += r[0].transcript;
-            }
-            const show = (finalText + interim).trim();
-            if (this.els.liveTranscript) this.els.liveTranscript.textContent = show ? `“${show}…”` : "";
-        };
-        sr.onerror = (ev) => { this._srErr = ev.error; };
-        sr.onend = async () => {
-            this.sr = null;
+        try {
+            await this.recorder.start({ onAutoStop: () => this._finishRecording() });
+        } catch (e) {
+            this._starting = false;
             this._clearRecUI();
-            const text = finalText.trim();
-            if (text) { this._emptyCount = 0; this._send(text); return; }
-
-            // Nothing heard -> re-prompt and listen again, capped at 2 tries.
-            if (this._srErr === "not-allowed" || this._srErr === "service-not-allowed") {
-                this._emptyCount = 0;
-                this.announce("Cần quyền micro.", "Hãy cho phép micro rồi chạm nút thử lại.", true);
-                return;
-            }
-            this._emptyCount = (this._emptyCount || 0) + 1;
-            if (this._emptyCount <= 2) {
-                const m = "Mình chưa nghe rõ.", s = "Bạn nói lại giúp tôi nhé.";
-                this.announce(m, s, false);
-                await this.speak(`${m} ${s}`);
-                this._autoListen();
-            } else {
-                this._emptyCount = 0;
-                this.announce("Mình vẫn chưa nghe được.", "Chạm nút khi bạn sẵn sàng nói nhé.", true);
-            }
-        };
-
-        try { sr.start(); }
-        catch (e) { this.sr = null; this._clearRecUI(); this.announce("Không bật được micro.", "Bạn thử lại nhé.", true); }
+            this.announce("Không truy cập được micro.", "Hãy cho phép micro rồi chạm nút thử lại.", true);
+            return;
+        }
+        this._starting = false;
+        if (this._wantStop) { this._finishRecording(); return; }
+        this.recording = true;
+        this._startCaption();
+        this._maxTimer = setTimeout(() => this._finishRecording(), 15000);
     }
 
-    /** Tap again to end early (otherwise it stops automatically on silence). */
+    /** Tap again to end early (otherwise VAD ends it on silence). */
     stopListening() {
-        if (this.sr) { try { this.sr.stop(); } catch (e) {} }
+        if (this._starting) { this._wantStop = true; return; }
+        this._finishRecording();
+    }
+
+    async _finishRecording() {
+        if (!this.recording) return;
+        this.recording = false;
+        if (this._maxTimer) { clearTimeout(this._maxTimer); this._maxTimer = null; }
+        const wav = this.recorder.stop();
+        this._stopCaption();
+        this._clearRecUI();
+        this.announce("Đang nhận diện…", "");
+        try {
+            const fd = new FormData();
+            fd.append("file", wav, "speech.wav");
+            const res = await fetch(`${BACKEND_URL}/api/voice/stt`, {
+                method: "POST", body: fd, signal: AbortSignal.timeout(30000),
+            });
+            const j = await res.json();
+            const text = (j.text || "").trim();
+            if (!text) {
+                this._emptyCount = (this._emptyCount || 0) + 1;
+                if (this._emptyCount <= 2) {
+                    const m = "Mình chưa nghe rõ.", s = "Bạn nói lại giúp tôi nhé.";
+                    this.announce(m, s, false);
+                    await this.speak(`${m} ${s}`);
+                    this._autoListen();
+                } else {
+                    this._emptyCount = 0;
+                    this.announce("Mình vẫn chưa nghe được.", "Chạm nút khi bạn sẵn sàng nói nhé.", true);
+                }
+                return;
+            }
+            this._emptyCount = 0;
+            this._send(text);
+        } catch (e) {
+            this.announce("Lỗi nhận diện giọng nói.", "Bạn thử lại hoặc chạm nút nói lại.", true);
+        }
     }
 
     // ----- Agent conversation -----------------------------------------------
@@ -362,7 +380,7 @@ class VoiceBookingApp {
             // replies it auto-listens, so usually you only tap once at the start.
             btn.addEventListener("click", (e) => {
                 e.preventDefault();
-                if (this.recording) this.stopListening();
+                if (this.recording || this._starting) this.stopListening();
                 else this.startListening();
             });
         }
